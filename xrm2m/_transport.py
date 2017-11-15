@@ -54,7 +54,7 @@ except ImportError:
   
 
 # Path to the JSON-RPC server binary.
-_JSON_RPC_SERVER_PATH = "wrap_json_rpc_server"
+_JSON_RPC_SERVER_PATH = "json_rpc_server"
 
 
 # Maximum amount to read in a single Transport.read() call.
