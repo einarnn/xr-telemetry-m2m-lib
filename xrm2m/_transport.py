@@ -11,6 +11,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
+import time
 
 """
 Transport layer.
@@ -53,7 +54,7 @@ except ImportError:
   
 
 # Path to the JSON-RPC server binary.
-_JSON_RPC_SERVER_PATH = "json_rpc_server"
+_JSON_RPC_SERVER_PATH = "wrap_json_rpc_server"
 
 
 # Maximum amount to read in a single Transport.read() call.
@@ -123,17 +124,38 @@ class SSHTransport(_BaseTransport):
                                    'allow_agent': allow_agent,
                                    'port': port}
         
+        self._channel = None
         self._client = paramiko.client.SSHClient()
         self._state = State.DISCONNECTED
         self._read_in_progress = False
 
+    def _gumph_wait_for(self, s):
+        assert self._channel is not None
+        while True:
+            gumph = self._recv().decode()
+            logger.debug('Gumph: {!r}'.format(gumph))
+            try:
+                last_line = gumph.splitlines()[-1]
+            except IndexError:
+                self._channel.send("\n")
+                continue
+            if s in last_line:
+                break
+        
     def _connect_thread(self):
+        assert self._channel is None
         self._client.set_missing_host_key_policy(
-                                               paramiko.client.AutoAddPolicy())
+            paramiko.client.AutoAddPolicy())
         self._client.connect(**self._connection_params)
-        (self._stdin,
-         self._stdout,
-         self._stderr) = self._client.exec_command("run json_rpc_server")
+        self._channel = self._client.invoke_shell(width=0, height=0)
+        # Turn off echoing and swallow any initial stuff
+        self._gumph_wait_for('#')
+        self._channel.send("run\n")
+        self._gumph_wait_for('$')
+        self._channel.send("stty -echo\n\n\n")
+        self._gumph_wait_for('$')
+        self._channel.send("json_rpc_server\n")
+
 
     @_async.coroutine
     def _connect_no_check(self, loop):
@@ -150,23 +172,32 @@ class SSHTransport(_BaseTransport):
 
         # After running json_rpc_server, the server should send some blank
         # lines followed by a timestamp. Read those lines here.
-        logger.debug("{}: Waiting for date line".format(self))
-        line = None
-        while line is None or line == b'\n':
-            line = yield From(self._read_no_check())
-        logger.debug("{}: Read date line {!r}".format(self, line))
+        #
+        # einarnn 2017/11/15: json_rpc_server seems to not do the date
+        # line now, commented out
+        #
+        # logger.debug("{}: Waiting for date line".format(self))
+        # line = None
+        # while line is None or line == b'\n':
+        #     line = yield From(self._read_no_check())
+        # logger.debug("{}: Read date line {!r}".format(self, line))
 
         self._state = State.CONNECTED
         
     @_async.coroutine
     def _disconnect_no_check(self):
         logger.debug("{}: Disconnect called".format(self))
+        self._channel.close()
+        self._channel = None
         self._client.close()
         self._state = State.DISCONNECTED
 
     def _write_no_check(self, data):
-        self._stdin.write(data)
-        self._stdin.flush()
+        self._channel.send(data)
+
+    def _recv(self):
+        """Wait for some data"""
+        return self._channel.recv(_MAX_READ_AMOUNT)
 
     @_async.coroutine
     def _read_no_check(self):
@@ -181,14 +212,14 @@ class SSHTransport(_BaseTransport):
         on_data_fut = _async.Future(self._loop)
         def on_data():
             on_data_fut.set_result(None)
-        self._loop.add_reader(self._stdout.channel.fileno(), on_data)
+        self._loop.add_reader(self._channel.fileno(), on_data)
 
         try:
             yield From(on_data_fut)
         finally:
-            self._loop.remove_reader(self._stdout.channel.fileno())
+            self._loop.remove_reader(self._channel.fileno())
 
-        d = self._stdout.readline()
+        d = self._channel.recv(_MAX_READ_AMOUNT).decode()
         if d == '':
             logger.debug("{}: Read returned {!r}".format(self, d))
             raise TransportNotConnected
